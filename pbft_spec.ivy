@@ -1,0 +1,214 @@
+#lang ivy1.8
+
+include pbft_abstract_kv
+
+module pbft_spec = {
+    
+    export action write(self:client_t, k:key_t, v:value_t)
+    import action write_done(self:client_t, k:key_t, v:value_t)
+
+    export action read(self:client_t, k:key_t)
+    import action read_done(self:client_t, k:key_t, v:value_t)
+
+    # When a server decides a value
+    import action decide(self:node, k:key_t, i:seq_t, v:value_t)
+
+    # Change view of any server
+    export action change_view(self:node, k:key_t)
+
+    # Make a node faulty
+    export action fault(self:node)
+    export action fault_correct(self:node)
+
+    # Send arbitrary messages to any server from a faulty node
+    export action faulty_propose(self:node, req:request_msg, dst:node)
+    export action faulty_preprepare(self:node, m:preprepare_msg_t, dst:node)
+    export action faulty_prepare(self:node, m:prepare_msg, dst:node)
+    export action faulty_commit(self:node, m:commit_msg, dst:node)
+    export action faulty_view_change(self:node, m:view_change_msg_t, dst:node)
+    export action faulty_new_view(self:node, m:new_view_msg, dst:node)
+
+    # Sign arbitrary messages
+    export action faulty_sign_preprepare(self:node, m:preprepare_msg_t)
+    export action faulty_sign_prepare(self:node, m:prepare_msg)
+    export action faulty_sign_commit(self:node, m:commit_msg)
+    export action faulty_sign_view_change(self:node, m:view_change_msg_t)
+    export action faulty_sign_new_view(self:node, m:new_view_msg)
+
+    common {
+        specification {
+            var decision(K:key_t, I:seq_t)         : value_t
+            var num_decided(K:key_t,N:node)        : seq_t
+            var curr_seq(K:key_t,N:node)           : seq_t
+            var faulty_node(N:node)                : bool
+            var faulty_nodes                       : nset
+            var pending                            : bool
+            relation decided(K:key_t,I:seq_t)
+            relation proposed(K:key_t,I:seq_t,V:value_t)
+
+            after init {
+                faulty_node(N)         := false;
+                decided(K,I)              := false;
+                proposed(K,I,V)       := false;
+                num_decided(K,N)          := 0;
+                
+                # Initially, no node is faulty
+                faulty_nodes            := nset.emptyset;
+            }
+
+            # This function manipulates abstract model's state
+            # Kinda un-safe, but then we can freely make a node act in a byzantine manner
+            before fault(self:node) {
+                require ~nset.member(self, faulty_nodes) -> nset.subminority(faulty_nodes);
+                require ~faulty_node(self);
+
+                faulty_nodes := faulty_nodes.add(self);
+                debug "Turning to the dark side" with node=self;
+
+                # Okay this is bad and causes interference, but since we are 
+                # anyway only fuzzing, its fine.
+                protocol.is_faulty(self) := true;
+            }
+
+            before fault_correct(self:node) {
+                # To prevent spam, only allow faulty nodes to call this
+                require protocol.is_faulty(self);
+                require faulty_node(self);
+            }
+
+            # This signs the request message on the client's behalf
+            before write(self:client_t,k:key_t,v:value_t) {
+                require v ~= noop;
+                # require ~client(self).pending_write;
+                proposed(k, server(N).next_seq(k), v) := true;
+                debug "writing:" with self=self, key=k, val=v;
+            }
+
+            before read(self:client_t,k:key_t) {
+                # require false;
+                require ~client(self).pending_write;
+            }
+
+            before faulty_propose(self:node, req:request_msg, dst:node) {
+                require faulty_node(self);
+            }
+            
+            # We cheat here, by knowing if the primary is faulty
+            before change_view(self:node, k:key_t) {
+                require protocol.is_faulty(server(self).next_leader(k));
+            }
+            
+            # Main decision invariant: Implementation decision follows protocol's learn
+            invariant decided(K,I) -> exists N. protocol.learn(K, I, decision(K,I), N)
+
+            # Faulty methods can only be accessed by faulty nodes
+            before faulty_sign_preprepare(self:node, m:preprepare_msg_t) {
+                require self = m.src;
+                require faulty_node(self)
+            }
+            before faulty_sign_prepare(self:node, m:prepare_msg) {
+                require self = m.src;
+                require faulty_node(self)
+            }
+            before faulty_sign_commit(self:node, m:commit_msg) {
+                require self = m.src;
+                require faulty_node(self)
+            }
+            before faulty_sign_view_change(self:node, m:view_change_msg_t) {
+                require self = m.src;
+                require faulty_node(self)
+            }
+            before faulty_sign_new_view(self:node, m:new_view_msg) {
+                require self = m.src;
+                require faulty_node(self)
+            }
+
+            before faulty_preprepare(self:node, m:preprepare_msg_t, dst:node) {
+                require faulty_node(self)
+            }
+            before faulty_prepare(self:node, m:prepare_msg, dst:node) {
+                require faulty_node(self)
+            }
+            before faulty_commit(self:node, m:commit_msg, dst:node) {
+                require faulty_node(self)
+            }
+            before faulty_view_change(self:node, m:view_change_msg_t, dst:node) {
+                require faulty_node(self)
+            }
+            before faulty_new_view(self:node, m:new_view_msg, dst:node) {
+                require faulty_node(self)
+            }
+
+
+            # Faulty functions implementation
+            implement fault(self:node) {
+                faulty_node(self) := true;
+            }
+            implement fault_correct(self:node) {
+                faulty_node(self) := false;
+            }
+
+            # Faulty nodes can send random requests
+            # But cannot sign new requests
+            implement faulty_propose(self:node, req:request_msg, dst:node) {
+                if faulty_node(self) {
+                    server(self).sock.send(server(dst).sock.id, req);
+                }
+            }
+
+            # Send faulty internal messages
+            implement faulty_preprepare(self:node, m:preprepare_msg_t, dst:node) {
+                if faulty_node(self) {
+                    server(self).unicast(m, dst);
+                }
+            }
+            implement faulty_prepare(self:node, m:prepare_msg, dst:node) {
+                if faulty_node(self) {
+                    server(self).unicast(m, dst);
+                }
+            }
+            implement faulty_commit(self:node, m:commit_msg, dst:node) {
+                if faulty_node(self) {
+                    server(self).unicast(m, dst);
+                }
+            }
+            implement faulty_view_change(self:node, m:view_change_msg_t, dst:node) {
+                if faulty_node(self) {
+                    server(self).unicast(m, dst);
+                }
+            }
+            implement faulty_new_view(self:node, m:new_view_msg, dst:node) {
+                if faulty_node(self) {
+                    server(self).unicast(m, dst);
+                }
+            }
+
+            # Sign any message, but signer must be a faulty node
+            implement faulty_sign_preprepare(self:node, m:preprepare_msg_t) {
+                if faulty_node(self) {
+                    sign_preprepare(self, m);
+                }
+            }
+            implement faulty_sign_prepare(self:node, m:prepare_msg) {
+                if faulty_node(self) {
+                    sign_prepare(self, m);
+                }
+            }
+            implement faulty_sign_commit(self:node, m:commit_msg) {
+                if faulty_node(self) {
+                    sign_commit(self, m);
+                }
+            }
+            implement faulty_sign_view_change(self:node, m:view_change_msg_t) {
+                if faulty_node(self) {
+                    sign_view_change(self, m);
+                }
+            }                 
+            implement faulty_sign_new_view(self:node, m:new_view_msg) {
+                if faulty_node(self) {
+                    sign_new_view(self, m);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,57 @@
+ #lang ivy1.8
+ 
+ global {
+        class msg_t = {
+            action handle(self:node, ^msg:msg_t)
+        }
+
+        subclass preprepare_msg_t of msg_t = {
+            field src : node
+            field view      : round_t
+            field seq       : seq_t
+            field req       : request_msg
+            action handle(self:node,^msg:preprepare_msg_t)
+        }
+
+        subclass prepare_msg of msg_t = {
+            field src : node
+            field view      : round_t
+            field seq       : seq_t
+            field req       : request_msg
+            action handle(self:node,^msg:prepare_msg)
+        }
+
+        # This is used by new_view to collect evidence from all view_change messages
+        class prepare_evidence = {
+            field pre_msg : preprepare_msg_t
+            field prepare_nodes : nset
+            field view_change_node : node
+            field orig_view : round_t
+        }
+
+        subclass commit_msg of msg_t = {
+            field src : node
+            field view      : round_t
+            field seq       : seq_t
+            field req       : request_msg
+            action handle(self:node,^msg:commit_msg)
+        }
+
+        subclass view_change_msg_t of msg_t = {
+            field src : node
+            field view       : round_t
+            field key        : key_t
+            field preprepares : vector[preprepare_msg_t]
+            field prepares : vector[vector[prepare_msg]]
+            action handle(self:node,^msg:view_change_msg_t)
+        }
+
+        subclass new_view_msg of msg_t = {
+            field src : node
+            field view      : round_t
+            field key        : key_t
+            field view_changes : vector[view_change_msg_t]
+            field prepares_evidence : vector[prepare_evidence]
+            action handle(self:node,^msg:new_view_msg)
+        }
+    }

@@ -1,0 +1,228 @@
+#lang ivy1.8
+
+include collections
+include indexset
+
+global {
+    instance node : iterable
+    instance nset : indexset(node)
+    instance round_t : unbounded_sequence
+    instance seq_t : unbounded_sequence
+    instance key_t    : iterable
+    alias noop = 0
+}
+
+type value_t
+
+isolate protocol = {
+    specification {
+        var preprepared_set(K:key_t, V:value_t, R:round_t, S:seq_t) : nset
+        var prepared_set(K:key_t, V:value_t, R:round_t, S:seq_t) : nset
+
+        relation is_faulty(N:node)
+        relation preprepared(K:key_t, V:value_t, R:round_t, S:seq_t, N:node)
+        relation prepared(K:key_t, V:value_t, R:round_t, S:seq_t, N:node)
+        relation committed_local(K:key_t, V:value_t, R:round_t, S:seq_t, N:node)
+        relation learn(K:key_t, S:seq_t, V:value_t, N:node)
+
+
+        # View Change Stuff
+        relation left_view(K:key_t, N:node, R:round_t)
+        relation entered_view(K:key_t, N:node, R:round_t, S:seq_t)
+
+        # Relation s.t. every two maj_non_faulty have a non-faulty node in common
+        relation maj_non_faulty(S:nset)
+        
+        # S1 is a subset of S2
+        function non_faulty_subset(S1,S2) = forall N. (nset.member(N,S1) & ~is_faulty(N) -> nset.member(N,S2))
+        
+        
+        # LOOK HERE: Uncomment THESE when checking the abstract model
+
+        # # This ensures that there can be atmost `f` failures
+        # # and hence every `maj_non_faulty` has atleast f+1 non-faulty nodes
+        # axiom nset.supermajority(S) -> maj_non_faulty(S)
+        # axiom maj_non_faulty(S1) & maj_non_faulty(S2) -> exists N. ~is_faulty(N) & nset.member(N,S1) & nset.member(N,S2)
+        # # `maj_non_faulty` is a subset of the `subset` relation
+        # axiom non_faulty_subset(S1,S2) & maj_non_faulty(S1) -> maj_non_faulty(S2)
+        
+
+        after init {
+            # Relations init
+            preprepared(K, V, R, S, N)         := false;
+            prepared(K, V, R, S, N)            := false;
+            committed_local(K, V, R, S, N)     := false;
+            learn(K, S, V, N)                  := false;
+            # Variables init
+            left_view(K, N, R)                 := false;
+            entered_view(K, N, R, S)           := R=0;
+            preprepared_set(K, V, R, S)        := nset.emptyset;
+            prepared_set(K, V, R, S)           := nset.emptyset;
+        }
+        
+        # Handle a 'valid' pre-prepare from the primary
+        action handle_preprepare(k:key_t, v:value_t, r:round_t, s:seq_t, n:node) = {
+            # Current view must be the same as preprepare's view
+            require ~is_faulty(n) -> entered_view(k,n,r,s);
+            require ~is_faulty(n) -> ~left_view(k,n,r);
+
+            # Must not be preprepared already for any value
+            require ~is_faulty(n) -> ~preprepared(k,V,r,s,n);
+
+            if ~is_faulty(n) {
+                preprepared(k, v, r, s, n) := true;
+                preprepared_set(k, v, r, s) := nset.add(preprepared_set(k, v, r, s), n);
+            }
+        }
+        invariant [unique_preprepare] ~is_faulty(N) &
+                                      preprepared(K, V1, R, S, N) & 
+                                      preprepared(K, V2, R, S, N)
+                                      -> V1 = V2
+        
+        invariant [preprepared_set_valid1] nset.member(N, preprepared_set(K, V, R, S)) & ~is_faulty(N) 
+                                       -> preprepared(K, V, R, S, N)
+        invariant [preprepared_set_valid2] preprepared(K, V, R, S, N) & ~is_faulty(N) -> nset.member(N, preprepared_set(K, V, R, S))
+        
+        
+        # Handle the case where a node has received 2*f+1 (including its own) prepare messages
+        action handle_prepare(k:key_t, v:value_t, r:round_t, s:seq_t, n:node, q:nset) = {
+            # Current view must be the same as all the prepares' view
+            require ~is_faulty(n) & r > 0 -> entered_view(k,n,r,s);
+            require ~is_faulty(n) -> ~left_view(k,n,r);
+
+            # Node must already be preprepared
+            require ~is_faulty(n) -> preprepared(k,v,r,s,n);
+
+            # Prepare set must be a supermajority
+            require ~is_faulty(n) -> nset.supermajority(q);
+
+            # All non-faulty members of this set should have pre-prepared (checked using prepare signs)
+            require ~is_faulty(n) -> (nset.member(N, q) & ~is_faulty(N) -> preprepared(k, v, r, s, N));
+            
+            if ~is_faulty(n) {
+                prepared_set(k, v, r, s) := nset.add(prepared_set(k, v, r, s), n);
+                prepared(k, v, r, s, n) := true;
+            }
+        }
+        invariant [prepared_set_valid1] nset.member(N, prepared_set(K, V, R, S)) & ~is_faulty(N) 
+                                       -> prepared(K, V, R, S, N)
+
+        invariant [prepared_set_valid2] prepared(K, V, R, S, N) & ~is_faulty(N) 
+                                        -> nset.member(N, prepared_set(K, V, R, S))
+
+        invariant [prepare_follows_preprepare] prepared(K, V, R, S, N) & ~is_faulty(N) 
+                                               -> preprepared(K, V, R, S, N)
+        
+        # The non_faulty_subset axiom helps with this.
+        # Since the prepare evidence is a super majority AND
+        # a non_faulty_subset of preprepared_set, this follows.
+        invariant [prepare_ensures_preprepare_majority] prepared(K, V, R, S, N) & ~is_faulty(N) 
+                                                        -> maj_non_faulty(preprepared_set(K, V, R, S))
+
+        invariant [unique_prepare] prepared(K, V1, R, S, N) & prepared(K, V2, R, S, N) & ~is_faulty(N) -> V1 = V2
+        
+        
+        # Handle the case where a node has received 2*f+1 (including its own) commit messages
+        action handle_commit(k:key_t, v:value_t, r:round_t, s:seq_t, n:node, q:nset) = {
+            # Current view must be the same as all the commit's view
+            require ~is_faulty(n) & r > 0 -> entered_view(k,n,r,s);
+            require ~is_faulty(n) -> ~left_view(k,n,r);
+
+            # Node must already be prepared
+            require ~is_faulty(n) -> prepared(k,v,r,s,n);
+
+            # Prepare set must be a supermajority
+            require ~is_faulty(n) -> nset.supermajority(q);
+
+            # The current node should be a part of this set
+            # require ~is_faulty(n) -> nset.member(n, q);
+
+            # All non-faulty members of this set should have prepared (checked using commits)
+            require ~is_faulty(n) -> (nset.member(N, q) & ~is_faulty(N) -> prepared(k,v, r, s, N));
+            
+            if ~is_faulty(n) {
+                committed_local(k, v, r, s, n) := true;
+                learn(k, s, v, n) := true;
+            }
+        }
+
+        invariant [commit_follows_prepare] committed_local(K, V, R, S, N) & ~is_faulty(N) 
+                                           -> prepared(K, V, R, S, N)
+        
+        invariant [commit_ensures_prepare_majority] committed_local(K, V, R, S, N) & ~is_faulty(N) 
+                                                    -> maj_non_faulty(prepared_set(K, V, R, S))
+        
+        # RSM Invariant: For the same sequence number, values committed by any (non-faulty) node in any round must be the same.
+        invariant [agreement] committed_local(K, V1, R1, S, N1) & committed_local(K, V2, R2, S, N2) & 
+                              ~is_faulty(N1) & ~is_faulty(N2) 
+                              -> V1 = V2
+        
+        action view_change(k:key_t, n:node, r:round_t) = {
+            require ~left_view(k,n,r);
+            left_view(k,n,R) := true if R < r else left_view(k,n,R);
+        }
+        # left_view is downward closed
+        invariant ~is_faulty(N) & left_view(K,N,R) & R1 < R -> left_view(K,N,R1)
+        
+        # Assumes min_s = 0
+        action new_view(k:key_t, n:node, r:round_t, s:seq_t, q:nset, preprepare : bool, value: value_t, pq:nset, pr: round_t, pn: node) = {
+
+            require ~is_faulty(n) -> ~preprepared(k, V, r, s, n);
+
+            require ~is_faulty(n) -> ~left_view(k,n,r) & ~entered_view(k,n,r,s);
+
+            require ~is_faulty(n) -> nset.supermajority(q);
+            
+            # All in quorum have promsed to leave all previous rounds
+
+            require ~is_faulty(n) & ~is_faulty(N) & R < r & nset.member(N,q) -> left_view(k,N,R);
+            
+            # If any non-faulty in the quorum has committed locally, then we must prepare the committed value
+
+            require ~is_faulty(n) & nset.member(N,q) & ~is_faulty(N) & R < r & prepared(k,V,R,s,N)
+                -> R <= pr
+                   & preprepare & pr < r & nset.member(pn,q)
+                   & nset.supermajority(pq)
+                   & forall N1. nset.member(N1,pq) & ~is_faulty(N) -> preprepared(k,value,pr,s,N1);
+
+            # No one in the quorum `q` has committed locally in a round > pr
+
+            require ~is_faulty(n) & nset.member(N,q) & ~is_faulty(N) & pr < R -> ~prepared(k,V,R,s,N);
+            
+            
+            if ~is_faulty(n) & preprepare {
+                preprepared(k,value, r, s, n) := true;
+                preprepared_set(k,value, r, s) := nset.add(preprepared_set(k,value, r, s), n);
+            }
+            entered_view(k,n,r,s) := true;
+            
+        }
+        
+        # TODO: Invariant: If seq no. `s` was prepared by a supermajority in view 'r' < current_view, then `s < max_s`
+        #       This ensures that `max_s` isn't an arbitrarily big number
+
+        
+        # Every value prepared by all non-faulty processes in a non-faulty majority in view `r`,
+        # must be preprepared by every non-faulty node in a view > `r`.
+        # Otherwise, it may lead to inconsistency
+        invariant [choosable]
+            maj_non_faulty(Q)
+            & (forall N:node. nset.member(N,Q) & ~is_faulty(N) -> ~left_view(K,N,R1) | prepared(K,V1,R1,S,N))
+            & R1 < R2
+            & ~is_faulty(N2)
+            & entered_view(K,N2,R2,S)
+                -> preprepared(K,V1,R2,S,N2)
+
+        invariant [prepared_only_if_entered] prepared(K,V,R,S,N) & ~is_faulty(N) -> entered_view(K,N,R,S)
+        invariant [preprepared_only_if_entered] preprepared(K,V,R,S,N) & ~is_faulty(N) -> entered_view(K,N,R,S)
+        
+    }
+}
+with nset, nset.majorities_intersect, round_t    # This tells Ivy to use certain specs in the proof of the above invariants
+
+## LOOK HERE: Uncomment this when checking the abstract model
+# export protocol.view_change
+# export protocol.new_view
+# export protocol.handle_commit
+# export protocol.handle_preprepare
+# export protocol.handle_prepare

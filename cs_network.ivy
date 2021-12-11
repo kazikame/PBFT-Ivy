@@ -1,0 +1,28 @@
+#lang ivy1.8
+
+include network
+
+module cs_network = {
+    instance timestamp_t : unbounded_sequence
+
+    type request_type = {
+        read_request,
+        write_request
+    }
+
+    # This doubles as a request and reply message
+    class request_msg = {
+        field key   : key_t
+        field val   : value_t
+        field rtype  : request_type
+        field t     : timestamp_t
+        field client : client_t
+
+        # Only for replies
+        field server : node
+        field seq    : seq_t
+    }
+
+    # Overlay for client-server communication
+    instance net : tcp.net(request_msg)
+}

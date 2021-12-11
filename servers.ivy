@@ -1,0 +1,522 @@
+#lang ivy1.8
+
+# This file contains an implementation of the multi-decree PBFT protocol
+include numbers
+include network
+
+include order
+include collections
+
+module servers(decide) = {
+    process server(self:node) = {
+        implementation {
+            var next_leader(K:key_t)                        : node          # Keeps track of the leader of the next view
+            var view(K:key_t)                               : round_t       # Current View
+            var next_view(K:key_t)                          : round_t       # Next View
+            var next_seq(K:key_t)                           : seq_t         # Next sequence number
+            var last_prep(K:key_t)                          : seq_t         # Last sequence number prepared
+            var preprepared(K:key_t, R:round_t, S:seq_t)    : bool          # Pre-prepared (k,r,s)
+            var preprepare_msg(K:key_t, R:round_t, S:seq_t) : preprepare_msg_t  # Message with which a (k,r,s) was pre-prepared
+
+            var prepared(K:key_t, R:round_t, S:seq_t)       : bool          # Prepared (k,r,s)
+            var prepared_value(K:key_t, R:round_t, S:seq_t) : value_t       # Value w/ which (k,r,s) was prepared
+
+            # Why does this have `V` as a parameter?
+            # Nodes can receive prepare messages BEFORE pre-prepare
+            # --> nodes don't know with which value they will pre-prepare, so
+            #     they keep track of EVERY prepare message.
+            var prepare_msgs(K:key_t, R:round_t, S:seq_t, V:value_t)         : vector[prepare_msg]
+            var prepare_msgs_nodes(K:key_t, R:round_t, S:seq_t, V:value_t)   : nset
+            
+            var committed(K:key_t, R:round_t, S:seq_t)                       : bool
+            var committed_value(K:key_t, R:round_t, S:seq_t)                 : value_t
+            var commit_msgs(K:key_t, R:round_t, S:seq_t, V:value_t)          : vector[commit_msg]
+            var commit_msgs_nodes(K:key_t, R:round_t, S:seq_t, V:value_t)    : nset
+            var next_to_decide(K:key_t)                                      : seq_t
+            
+            # True if trying to change view right now
+            var changing_view(K:key_t)                                       : bool
+            
+            # Stores view_change messages
+            var view_change_msgs(K:key_t,R:round_t)                         : vector[view_change_msg_t]
+            var view_change_nodes(K:key_t,R:round_t)                        : nset
+
+            after init {
+                view(K)                := 0;
+                next_view(K)           := 0;
+                next_seq(K)            := 0;
+                last_prep(K)         := 0;
+                preprepared(K, R, S)   := false;
+                prepared(K, R, S)      := false;
+                committed(K, R, S)     := false;
+                changing_view(K)       := false;
+                next_to_decide(K)      := 0;
+
+                # Init next_leader
+                if some (n:node) leader_of(n, 1) {
+                    next_leader(K)           := n;
+                }
+            }
+            function leader_of(N:node,R:round_t) = round_t.mod(R,cast(node.max)+1) = cast(N)
+            
+            # Handle request from a client
+            action propose(req:request_msg) = {
+                if ~faulty_node(self) & check_request(req) {
+                    if leader_of(self, view(req.key)) & req.val ~= noop {
+                        var msg : preprepare_msg_t;
+                        msg.src := self;
+                        msg.view := view(req.key);
+                        msg.seq := next_seq(req.key);
+                        msg.req := req;
+                        sign_preprepare(self, msg);
+                        broadcast(msg);
+
+                        next_seq(req.key) := next_seq(req.key).next;
+                    }
+                }
+            }
+
+            implement preprepare_msg_t.handle(m:preprepare_msg_t) {
+                if ~faulty_node(self) & check_preprepare(m) {
+                    # Check the message is by leader
+                    var k := m.req.key;
+                    if view(k) = m.view & ~changing_view(k) & leader_of(m.src, view(k)) {
+                        debug "pre-prepare message is by the leader" with src=m.src, view=view(k);
+
+                        # Check if you haven't preprepared already, and report if you have!
+                        if ~preprepared(k, view(k), m.seq) {
+                            preprepared(k, view(k), m.seq) := true;
+                            preprepare_msg(k, view(k), m.seq) := m;
+
+                            # dummy new_view :(
+                            if (view(k) > 0) {
+                                call protocol.new_view(k, self, view(k), m.seq, view_change_nodes(k,view(k)), false, 
+                                                    noop, nset.emptyset, 0, 0);
+                            }
+                            call protocol.handle_preprepare(k, m.req.val, view(k), m.seq, self);
+                            
+                            # broadcast prepare messages
+
+                            var prepare : prepare_msg;
+                            prepare.src := self;
+                            prepare.view := view(k);
+                            prepare.req := m.req;
+                            prepare.seq := m.seq;
+                            sign_prepare(self, prepare);
+                            debug "preprepare accepted; broadcasting prepares";
+
+                            broadcast(prepare);
+
+                            call try_prepare(k, m.req.val, m.seq);
+                        }
+                        else {
+                            debug "Valid preprepare message sent for preprepared round?" with val = m.req.val, view = view(k), seq = m.seq;
+                        }
+                    }
+                }
+                else {
+                    debug "preprepare failed check";
+                }
+            }
+            action try_prepare(k:key_t, v:value_t, s: seq_t) = {
+                # Check if prepared(...) is true
+                var pre_msg_val : value_t := preprepare_msg(k, view(k), s).req.val;
+                if preprepared(k, view(k), s) &
+                pre_msg_val = v &
+                nset.supermajority(prepare_msgs_nodes(k, view(k), s, v)) &
+                ~prepared(k, view(k), s) {
+                    debug "Prepared to commit!";
+                    prepared(k, view(k), s) := true;
+                    if s >= last_prep(k) {
+                        last_prep(k) := s.next;
+                    }
+                    prepared_value(k, view(k), s) := v;
+
+                    debug "Calling handle_prepare" with k=k, v=v, r=view(k), s=s, n=self;
+                    call protocol.handle_prepare(k, v, view(k), s, self, prepare_msgs_nodes(k, view(k), s, v)); 
+
+                    # TODO: Clear prepare_set for every other value for this view(k),seq
+
+                    # Broadcast commits
+                    var commit : commit_msg;
+                    commit.src := self;
+                    commit.view := view(k);
+                    commit.seq := s;
+                    commit.req := preprepare_msg(k, view(k), s).req;
+                    sign_commit(self, commit);
+
+                    broadcast(commit);
+                }
+                else {
+                    # debug "Not a supermajority yet, still need to wait :(";
+                }
+            }
+            
+            implement prepare_msg.handle(m:prepare_msg) {
+                if ~faulty_node(self) & check_prepare(m) {
+                    # debug "prepare message correctly signed";
+                    var k := m.req.key;
+                    if view(k) = m.view & ~changing_view(k)  {
+                        # debug "prepare message matches view no.";
+                        if ~nset.member(m.src, prepare_msgs_nodes(k, m.view, m.seq, m.req.val)) {
+                            prepare_msgs_nodes(k, m.view, m.seq, m.req.val) := prepare_msgs_nodes(k, m.view, m.seq, m.req.val).add(m.src);
+                            prepare_msgs(k, m.view, m.seq, m.req.val) := prepare_msgs(k, m.view, m.seq, m.req.val).append(m);
+                        }
+                        else {
+                            debug "duplicate prepare message received";
+                        }
+                        debug "Prepare Message Nodes: " with nset=prepare_msgs_nodes(k, m.view, m.seq, m.req.val), self=self, k=k, v=m.req.val, r=m.view, s=m.seq;
+                        call try_prepare(k, m.req.val, m.seq);
+                        call try_commit(k, m.req.val, m.seq);
+                    }
+                }
+                else {
+                    debug "prepare message failed check";
+                }
+            }
+            
+            action try_commit(k:key_t, v:value_t, s:seq_t) = {
+                var pre_msg_val : value_t := preprepare_msg(k, view(k), s).req.val;
+
+                if prepared(k, view(k), s) &
+                nset.supermajority(commit_msgs_nodes(k, view(k), s, v)) &
+                pre_msg_val= v &
+                ~committed(k, view(k), s) {
+                    
+                    committed(k, view(k), s) := true;
+                    committed_value(k, view(k), s) := v;
+
+                    call protocol.handle_commit(k, v, view(k), s, self, commit_msgs_nodes(k, view(k), s, v));
+                    
+                    while committed(k, view(k), next_to_decide(k)) { 
+                        call decide(self, k, s, v);
+                        var req := preprepare_msg(k, view(k), next_to_decide(k)).req;
+                        req.server := self;
+                        req.seq    := preprepare_msg(k, view(k), next_to_decide(k)).seq;
+                        sock.send(client(req.client).sock.id,req);  # We pass it on to client.
+
+                        next_to_decide(k) := next_to_decide(k).next;
+                    }
+                }
+                else {
+                    # debug "Still not a supermajority, can't commit :(";
+                }
+            }
+            
+            implement commit_msg.handle(m:commit_msg) {
+                if ~faulty_node(self) & check_commit(m) {
+                    var k := m.req.key;
+                    if view(k) = m.view & ~changing_view(k) {
+                        if ~nset.member(m.src, commit_msgs_nodes(k, m.view, m.seq, m.req.val)) {
+                            commit_msgs_nodes(k, m.view, m.seq, m.req.val) := commit_msgs_nodes(k, m.view, m.seq, m.req.val).add(m.src);
+                            commit_msgs(k, m.view, m.seq, m.req.val) := commit_msgs(k, m.view, m.seq, m.req.val).append(m);
+                        }
+                        debug "Committed Nodes:" with nset=commit_msgs_nodes(k, m.view, m.seq, m.req.val), self=self, k=k, v=m.req.val, r=m.view, s=m.seq;
+
+                        call try_commit(k, m.req.val, m.seq);
+                    }
+                }
+            }
+            
+            # Builds a vector of pre-prepare messages for `next_view`
+            # using view_change messages
+            action preprepares_from_view_change(k:key_t, m:vector[view_change_msg_t], next_view:round_t) returns (vec:vector[prepare_evidence]) = {
+                # Determine the maximum sequence number up to which
+                # we have evidence in the form of prepare messages
+                var max_s : seq_t := 0;
+                for it,vc in m {
+                    var last_element_it := vc.preprepares.end - 1;
+                    var seq := vc.preprepares.value(last_element_it).seq;
+                    if seq > max_s {
+                        max_s := seq;
+                    }
+                }
+                
+                # A no-op message
+                var noop_message : prepare_evidence;
+
+                noop_message.pre_msg.src := self;
+                noop_message.pre_msg.view := next_view;
+                noop_message.pre_msg.req.key := k;
+                noop_message.pre_msg.req.val := noop;
+                
+                # Tracks the highest prepared round for every sequence number
+                var highest_round_prep(S:seq_t) : prepare_evidence;
+                highest_round_prep(S) := noop_message if S <= max_s else highest_round_prep(S);
+                
+                # Find a prepared value for every sequence number up to max_s
+                # If multiple, choose the one which was prepared in the highest round
+                # If none, it remains unchanged as a no-op
+                # Comment: Unfortunately nested for-loops don't work well in ivy
+                #          Hence need to resort to an outer while loop
+                var it := m.begin;
+                while it < m.end {
+                    var vc := m.value(it);
+                    for jt,prep in vc.preprepares {
+                        var seq := prep.seq;
+                        if (highest_round_prep(seq).pre_msg.req.val = noop) |
+                            highest_round_prep(seq).pre_msg.view < prep.view {
+                            highest_round_prep(seq).pre_msg := prep;
+                            highest_round_prep(seq).orig_view := prep.view;
+                            highest_round_prep(seq).view_change_node := vc.src;
+
+                            # Copy prepares
+                            # Ivy doesn't like an inner for-loop, so using a while-loop instead
+                            var kt := vc.prepares.value(jt).begin;
+                            while kt < vc.prepares.value(jt).end {
+                                var prepare := vc.prepares.value(jt).value(kt);
+                                highest_round_prep(seq).prepare_nodes := highest_round_prep(seq).prepare_nodes.add(prepare.src);
+                                kt := kt.next;
+                            }
+                        }
+                    }
+                    it := it.next;
+                }
+                
+                # Fill in the return `vec`
+                var i : seq_t := 0;
+                while i <= max_s {
+                    var evidence : prepare_evidence;
+                    evidence := highest_round_prep(i);                
+                    evidence.pre_msg.view := next_view;
+                    evidence.pre_msg.src := self;
+                    sign_preprepare(self, evidence.pre_msg);
+                    vec := vec.append(evidence);
+                    i := i.next;
+                }
+            }
+            
+            action is_view_change_msg_valid(k:key_t, m:view_change_msg_t, r:round_t) returns (ok:bool) = {
+                var reqs(S:seq_t) : request_msg;
+                ok := m.view = r;
+                var noop_req : request_msg;
+                noop_req.val := noop;
+                # Check pre-prepares and store req messages
+                for it,preprep in m.preprepares {
+                    if ok & ~check_preprepare(preprep) & preprep.req.key = k {
+                        ok := false;
+                    }
+                    # No early break in ivy :(
+                    reqs(preprep.seq) := preprep.req if preprep.req.val ~= noop else noop_req;
+                }
+
+                # Check prepares
+                var it := m.prepares.begin;
+                while it < m.prepares.end {
+                    var preps := m.prepares.value(it);
+                    var prep_set : nset;
+                    prep_set := nset.emptyset;
+
+                    var preprep := m.preprepares.value(it);
+                    for jt,prep in preps {
+                        if reqs(prep.seq).val ~= noop {
+                            if ok & ~check_prepare(prep) {
+                                ok := false;
+                            }
+                            # No early break
+                            if prep.req ~= preprep.req |
+                            prep.view ~= preprep.view |
+                            prep.seq ~= preprep.seq {
+                                ok := false;
+                            }
+                            prep_set := prep_set.add(prep.src);
+                        }
+                    }
+                    if ok & preprep.req.val ~= noop & ~nset.supermajority(prep_set) {
+                        ok := false;
+                    }
+                    it := it.next;
+                }
+            }
+            
+            # Check if requirements to send a new_view message are satisfied
+            action try_new_view(k:key_t, r:round_t) = {
+                if changing_view(k) & nset.supermajority(view_change_nodes(k,r)) {
+                    var new_view : new_view_msg;
+                    new_view.key := k;
+                    new_view.src := self;
+                    new_view.view := r;
+                    new_view.view_changes := view_change_msgs(k,r);
+                    new_view.prepares_evidence := preprepares_from_view_change(k,view_change_msgs(k,r), r);
+
+                    sign_new_view(self, new_view);
+
+                    broadcast(new_view);
+                    debug "Changed view!" with self=self, old_view=view(k), new_view=r;
+                    # Optimization: The new primary doesn't need to wait for the new_view message to change views
+                    view(k) := r;
+                    changing_view(k) := false;
+                }
+            }
+
+            # Handles an incoming view_change message
+            implement view_change_msg_t.handle(m:view_change_msg_t) {
+                # Check if signed properly
+                if ~faulty_node(self) & check_view_change(m) {
+                    # Only the leader should accept non-faulty messages
+                    if leader_of(self, m.view) {
+
+                        # Check if all the preprepares and prepares 
+                        if ~nset.member(m.src, view_change_nodes(m.key, m.view)) &
+                        is_view_change_msg_valid(m.key, m, m.view) {
+                            view_change_msgs(m.key, m.view) := view_change_msgs(m.key, m.view).append(m);
+                            view_change_nodes(m.key, m.view) := view_change_nodes(m.key, m.view).add(m.src);
+
+                            # Check if can send the new_view message
+                            call try_new_view(m.key, m.view);
+                        }
+                    }
+                }
+            }
+
+            # Handles an incoming new_view message
+            implement new_view_msg.handle(m:new_view_msg) {
+                if ~faulty_node(self) & check_new_view(m) & view(m.key) < m.view & changing_view(m.key) {
+
+                    # Check all view change messages
+                    var ok : bool := true;
+                    for it,msg in m.view_changes {
+                        if ok & ~is_view_change_msg_valid(m.key, msg, m.view) {
+                            debug "New View: found an invalid view change";
+                            ok := false;
+                        }
+                        view_change_nodes(m.key, m.view) := view_change_nodes(m.key, m.view).add(msg.src);
+                        view_change_msgs(m.key, m.view) := view_change_msgs(m.key, m.view).append(msg);
+                    }
+
+                    for it,msg in m.prepares_evidence {
+                        if ok & ~check_preprepare(msg.pre_msg) & m.key = msg.pre_msg.req.key {
+                            debug "New View: found an invalid pre-prepare";
+                            ok := false;
+                        }
+                    }
+                    if ~nset.supermajority(view_change_nodes(m.key, m.view)) {
+                        ok := false;
+                        debug "New View: # of view change messages do not form a supermajority";
+                    }
+
+                    if ok {
+                        var preprepares := preprepares_from_view_change(m.key, m.view_changes, m.view);
+                        for it,msg in preprepares {
+                            if ok & msg ~= m.prepares_evidence.value(it) {
+                                ok := false;
+                            }
+                        }
+                    }
+
+                    # Everything checked, time to prepare!
+                    if ok {
+                        var k := m.key;
+                        view(k) := m.view;
+                        changing_view(k) := false;
+                        for it,msg in m.prepares_evidence {
+                            preprepared(m.key, view(k), msg.pre_msg.seq) := true;
+                            preprepare_msg(m.key, view(k), msg.pre_msg.seq) := msg.pre_msg;
+                            
+                            # Ghost action
+                            call protocol.new_view(m.key, self, view(k), msg.pre_msg.seq, view_change_nodes(k, view(k)), true, 
+                                                msg.pre_msg.req.val, msg.prepare_nodes, msg.orig_view, msg.view_change_node);
+                            
+                            # broadcast new prepare messages
+                            var prepare : prepare_msg;
+                            prepare.src := self;
+                            prepare.view := view(k);
+                            prepare.req := msg.pre_msg.req;
+                            prepare.seq := msg.pre_msg.seq;
+                            sign_prepare(self, prepare);
+                            debug "new_view preprepare accepted; broadcasting prepares";
+
+                            broadcast(prepare);
+                        }
+                    }
+                }
+            }
+
+            common {
+                instance server_net : tcp.net(msg_t)
+            }
+
+            instance internal_sock : server_net.socket
+            
+            implement change_view(k:key_t) {
+                if ~faulty_node(self) {
+                    debug "Trying to change view";
+                    # Cheating Alert: only change view if the current leader is faulty.
+                    changing_view(k) := true;
+                    # Set next_view
+                    next_view(k) := next_view(k).next;
+
+                    # Change the NEXT leader -- this is the leader AFTER next_view
+                    var r := next_view(k).next;
+                    if some (n:node) leader_of(n, r) {
+                        next_leader(k) := n;
+                    }
+                    # Make a view_change message and broadcast
+                    var msg : view_change_msg_t;
+                    msg.view := next_view(k);
+                    msg.src := self;
+                    msg.key := k;
+
+                    # Check which seq are prepared
+                    var s : seq_t := 0;
+                    while s < last_prep(k) {
+                        var r : round_t := view(k).next;
+                        var found := false;
+
+                        while r > 0 & ~found {
+                            r := r - 1;
+                            if prepared(k, r, s) {
+                                msg.preprepares := msg.preprepares.append(preprepare_msg(k, r, s));
+                                msg.prepares := msg.prepares.append(prepare_msgs(k, r, s, prepared_value(k, r, s)));
+                                found := true;
+                            }
+                        }
+                        s := s.next;
+                    }
+
+                    # Sign view message
+                    sign_view_change(self, msg);
+                    broadcast(msg);
+
+                    # Ghost call
+                    call protocol.view_change(k, self, next_view(k));
+                }
+                
+            }
+
+            implement internal_sock.recv(src:tcp.endpoint, smsg:msg_t) {
+                # debug "recv" with server = self, smsg = smsg;
+                smsg.handle(self);
+            }
+
+            action unicast(outgoing:msg_t, dst_id : node) = {
+                # debug "send" with server = self, msg = outgoing, dst=dst_id;
+                internal_sock.send(server(dst_id).internal_sock.id,outgoing);
+            }
+
+            action broadcast(outgoing:msg_t) = {
+                for it,dst_id in node.iter {
+                    unicast(outgoing, dst_id);
+                }
+            }
+
+            # Connection with client
+            instance sock : net.socket
+            implement sock.recv(src:tcp.endpoint, m:request_msg) {
+                # debug "recv" with server = self, msg = m;
+                if ~faulty_node(self) {
+                    # Only leader detects
+                    if leader_of(self, view(m.key)) {
+                        if m.rtype = write_request {
+                            propose(m);
+                        }
+                        else { # Read Request
+                            debug "READ REQUEST";
+                        }
+                    }
+                    
+                }
+            }
+        }
+    }  with nset, nset.api, nset.majorities_intersect, protocol, round_t, node, vector[preprepare_msg_t], vector[prepare_msg], vector[vector[prepare_msg]], vector[checkpoint_msg], vector[view_change_msg_t], vector[commit_msg]
+}

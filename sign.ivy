@@ -1,0 +1,76 @@
+#lang ivy1.8
+
+module sign = {
+    common {
+        specification {
+            relation signed_requests(M:request_msg)
+            relation signed_preprepares(M:preprepare_msg_t)
+            relation signed_prepares(M:prepare_msg)
+            relation signed_commits(M:commit_msg)
+            relation signed_view_changes(M:view_change_msg_t)
+            relation signed_new_views(M:new_view_msg)
+
+            after init {
+                signed_requests(M)      := false;
+                signed_preprepares(M)   := false;
+                signed_prepares(M)      := false;
+                signed_commits(M)       := false;
+                signed_view_changes(M)  := false;
+                signed_new_views(M)     := false;
+            }
+
+            # Not sure how to access base class members from derived calss objects, so here we are :(
+            # Also not sure if `operator=` is virtual by default (probably not)
+            # Ivy doesn't allow polymorphism either :(
+            action sign_request(self:client_t, msg:request_msg) = {
+                require self = msg.client;
+                signed_requests(msg) := true;
+            }
+            action check_request(msg:request_msg) returns (ok:bool) = {
+                ok := signed_requests(msg);
+            }
+
+            action sign_preprepare(self:node, msg:preprepare_msg_t) = {
+                require self = msg.src;
+                signed_preprepares(msg) := true;
+            }
+            action check_preprepare(msg:preprepare_msg_t) returns (ok:bool) = {
+                ok := signed_preprepares(msg);
+            }
+
+            action sign_prepare(self:node, msg:prepare_msg) = {
+                require self = msg.src;
+                signed_prepares(msg) := true;
+            }
+            action check_prepare(msg:prepare_msg) returns (ok:bool) = {
+                ok := signed_prepares(msg);
+            }
+
+            action sign_commit(self:node, msg:commit_msg) = {
+                require self = msg.src;
+                signed_commits(msg) := true;
+            }
+            action check_commit(msg:commit_msg) returns (ok:bool) = {
+                ok := signed_commits(msg);
+            }
+
+            action sign_view_change(self:node, msg:view_change_msg_t) = {
+                require self = msg.src;
+                signed_view_changes(msg) := true;
+            }
+            action check_view_change(msg:view_change_msg_t) returns (ok:bool) = {
+                ok := signed_view_changes(msg);
+            }
+
+            action sign_new_view(self:node, msg:new_view_msg) = {
+                require self = msg.src;
+                signed_new_views(msg) := true;
+            }
+            action check_new_view(msg:new_view_msg) returns (ok:bool) = {
+                ok := signed_new_views(msg);
+            }
+        }
+
+        # No implementation :(
+    }
+}

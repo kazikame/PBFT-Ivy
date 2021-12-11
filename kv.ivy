@@ -1,0 +1,116 @@
+#lang ivy1.8
+include order
+include collections
+include network
+
+global {
+    instance client_t : iterable
+}
+
+include sign
+include pbft_spec
+
+include cs_network
+instantiate cs_network
+
+include servers
+include server_message_types
+
+instantiate sign
+instantiate pbft_spec
+instantiate servers(decide)
+
+process client(self:client_t) = {
+
+    implementation {
+        instance sock : net.socket
+        var pending_write_key : key_t
+        var pending_write_val : value_t
+        var pending_write : bool
+        var decided_nodes(K:key_t, S:seq_t) : nset
+        var min_seq(K:key_t)       : seq_t
+
+        after init {
+            pending_write := false;
+            decided_nodes(K, S) := nset.emptyset;
+            min_seq(K) := 0;
+        }
+
+        implement write(k:key_t, v:value_t) {
+            var msg : request_msg;
+            msg.key := k;
+            msg.val := v;
+            msg.rtype := write_request;
+            msg.t := 0; # Timestamp, ignored
+            msg.client := self;
+            sign_request(self, msg);
+            pending_write_key := k;
+            pending_write_val := v;
+            pending_write := true;
+            # Should only send to primary
+            # But knowing who the primary is difficult
+            # So just broadcast
+            broadcast(msg);
+        }
+        implement read(k:key_t) {
+            var msg : request_msg;
+            msg.key := k;
+            msg.rtype := read_request;
+            msg.t := 0; # Timestamp, ignored
+            msg.client := self;
+
+            broadcast(msg);
+        }
+
+        implement sock.recv(src:tcp.endpoint, msg:request_msg) {
+            # debug "recv" with client = self, msg = msg;
+            if msg.rtype = write_request {
+                if msg.key = pending_write_key & 
+                   msg.val = pending_write_val & 
+                   msg.seq >= min_seq(msg.key) {
+                    decided_nodes(msg.key, msg.seq) := decided_nodes(msg.key, msg.seq).add(msg.server);
+
+                    if nset.greater_than_third(decided_nodes(msg.key, msg.seq)) {
+                        call write_done(self, msg.key, msg.val);
+                        min_seq(msg.key) := msg.seq.next;
+                        pending_write := false;
+                        decided_nodes(msg.key, msg.seq) := nset.emptyset;
+                    }
+                    else {
+                        debug "Not enough decides" with set=decided_nodes(msg.key, msg.seq);
+                    }
+                }
+            }
+        }
+
+        action broadcast(outgoing:request_msg) = {
+            for it,dst_id in node.iter {
+                unicast(outgoing, dst_id);
+            }
+        }
+        action unicast(outgoing:request_msg, dst_id : node) = {
+            sock.send(server(dst_id).sock.id,outgoing);
+        }
+    }
+}
+
+# LOOK HERE: To enable faults, uncomment the following line
+attribute fault.weight = "0.1"
+
+
+# We don't want too many writes
+# Otherwise write requests hamper progress :(
+attribute write.weight = "0.1"
+
+
+attribute faulty_propose.weight = "0.1"
+attribute faulty_preprepare.weight = "0.1"
+attribute faulty_prepare.weight = "0.1"
+attribute faulty_commit.weight = "0.1"
+attribute faulty_view_change.weight = "0.1"
+attribute faulty_new_view.weight = "0.1"
+attribute faulty_sign_preprepare.weight = "0.1"
+attribute faulty_sign_prepare.weight = "0.1"
+attribute faulty_sign_commit.weight = "0.1"
+attribute faulty_sign_view_change.weight = "0.1"
+attribute faulty_sign_new_view.weight = "0.1"
