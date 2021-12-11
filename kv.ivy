@@ -24,16 +24,14 @@ process client(self:client_t) = {
 
     implementation {
         instance sock : net.socket
-        var pending_write_key : key_t
-        var pending_write_val : value_t
-        var pending_write : bool
         var decided_nodes(K:key_t, S:seq_t) : nset
-        var min_seq(K:key_t)       : seq_t
+        var next_write_seq(K:key_t)         : seq_t
+        var last_commit_seq(K:key_t)        : seq_t
 
         after init {
-            pending_write := false;
             decided_nodes(K, S) := nset.emptyset;
-            min_seq(K) := 0;
+            next_write_seq(K)   := 0;
+            last_commit_seq(K)  := 0;
         }
 
         implement write(k:key_t, v:value_t) {
@@ -44,9 +42,7 @@ process client(self:client_t) = {
             msg.t := 0; # Timestamp, ignored
             msg.client := self;
             sign_request(self, msg);
-            pending_write_key := k;
-            pending_write_val := v;
-            pending_write := true;
+
             # Should only send to primary
             # But knowing who the primary is difficult
             # So just broadcast
@@ -58,26 +54,32 @@ process client(self:client_t) = {
             msg.rtype := read_request;
             msg.t := 0; # Timestamp, ignored
             msg.client := self;
-
             broadcast(msg);
         }
 
         implement sock.recv(src:tcp.endpoint, msg:request_msg) {
             # debug "recv" with client = self, msg = msg;
             if msg.rtype = write_request {
-                if msg.key = pending_write_key & 
-                   msg.val = pending_write_val & 
-                   msg.seq >= min_seq(msg.key) {
+                if msg.seq >= next_write_seq(msg.key) {
                     decided_nodes(msg.key, msg.seq) := decided_nodes(msg.key, msg.seq).add(msg.server);
 
                     if nset.greater_than_third(decided_nodes(msg.key, msg.seq)) {
                         call write_done(self, msg.key, msg.val);
-                        min_seq(msg.key) := msg.seq.next;
-                        pending_write := false;
-                        decided_nodes(msg.key, msg.seq) := nset.emptyset;
+                        
+                        next_write_seq(msg.key) := msg.seq.next;
                     }
                     else {
-                        debug "Not enough decides" with set=decided_nodes(msg.key, msg.seq);
+                        # debug "Not enough decides" with set=decided_nodes(msg.key, msg.seq);
+                    }
+                }
+            }
+            else { # Read Response
+                if msg.seq >= last_commit_seq(msg.key) {
+                    decided_nodes(msg.key, msg.seq) := decided_nodes(msg.key, msg.seq).add(msg.server);
+
+                    if nset.greater_than_third(decided_nodes(msg.key, msg.seq)) {
+                        call read_done(self, msg.key, msg.val);
+                        last_commit_seq(msg.key) := msg.seq;
                     }
                 }
             }
@@ -94,13 +96,14 @@ process client(self:client_t) = {
     }
 }
 
-# LOOK HERE: To enable faults, uncomment the following line
-attribute fault.weight = "0.1"
+# LOOK HERE: To disable faults, uncomment the following line
+# attribute fault.weight = "0"
 
 
-# We don't want too many writes
-# Otherwise write requests hamper progress :(
+# We don't want too many writes/reads
+# Otherwise they hamper progress :(
 attribute write.weight = "0.1"
+attribute read.weight = "0.5"
 
 
 attribute faulty_propose.weight = "0.1"

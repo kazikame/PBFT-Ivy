@@ -41,17 +41,22 @@ module servers(decide) = {
             var view_change_msgs(K:key_t,R:round_t)                         : vector[view_change_msg_t]
             var view_change_nodes(K:key_t,R:round_t)                        : nset
 
+            # Actual Store
+            var kv(K:key_t)             : value_t
+            var kv_seq(K:key_t)         : seq_t
+
             after init {
                 view(K)                := 0;
                 next_view(K)           := 0;
                 next_seq(K)            := 0;
-                last_prep(K)         := 0;
+                last_prep(K)           := 0;
                 preprepared(K, R, S)   := false;
                 prepared(K, R, S)      := false;
                 committed(K, R, S)     := false;
                 changing_view(K)       := false;
                 next_to_decide(K)      := 0;
-
+                kv(K)                  := noop;
+                kv_seq(K)              := 0;
                 # Init next_leader
                 if some (n:node) leader_of(n, 1) {
                     next_leader(K)           := n;
@@ -75,7 +80,8 @@ module servers(decide) = {
                     }
                 }
             }
-
+            
+            # Handle a pre-prepare message from the primary
             implement preprepare_msg_t.handle(m:preprepare_msg_t) {
                 if ~faulty_node(self) & check_preprepare(m) {
                     # Check the message is by leader
@@ -189,7 +195,13 @@ module servers(decide) = {
                     call protocol.handle_commit(k, v, view(k), s, self, commit_msgs_nodes(k, view(k), s, v));
                     
                     while committed(k, view(k), next_to_decide(k)) { 
+                        
+                        # Ghost action
                         call decide(self, k, s, v);
+                        if kv_seq(k) <= s {
+                            kv(k) := v;
+                            kv_seq(k) := s;
+                        }
                         var req := preprepare_msg(k, view(k), next_to_decide(k)).req;
                         req.server := self;
                         req.seq    := preprepare_msg(k, view(k), next_to_decide(k)).seq;
@@ -409,6 +421,7 @@ module servers(decide) = {
                         var k := m.key;
                         view(k) := m.view;
                         changing_view(k) := false;
+                        next_to_decide(k) := 0;
                         for it,msg in m.prepares_evidence {
                             preprepared(m.key, view(k), msg.pre_msg.seq) := true;
                             preprepare_msg(m.key, view(k), msg.pre_msg.seq) := msg.pre_msg;
@@ -505,14 +518,13 @@ module servers(decide) = {
             implement sock.recv(src:tcp.endpoint, m:request_msg) {
                 # debug "recv" with server = self, msg = m;
                 if ~faulty_node(self) {
-                    # Only leader detects
-                    if leader_of(self, view(m.key)) {
-                        if m.rtype = write_request {
+                    # Only leader responds to write requests
+                    if leader_of(self, view(m.key)) & m.rtype = write_request {
                             propose(m);
-                        }
-                        else { # Read Request
-                            debug "READ REQUEST";
-                        }
+                    }
+                    else if m.rtype = read_request {
+                        m.val := kv(m.key);
+                        sock.send(client(m.client).sock.id, m);
                     }
                     
                 }

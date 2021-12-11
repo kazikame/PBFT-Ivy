@@ -84,11 +84,6 @@ module pbft_spec = {
                 debug "writing:" with self=self, key=k, val=v;
             }
 
-            before read(self:client_t,k:key_t) {
-                # require false;
-                require ~client(self).pending_write;
-            }
-
             before faulty_propose(self:node, req:request_msg, dst:node) {
                 require faulty_node(self);
             }
